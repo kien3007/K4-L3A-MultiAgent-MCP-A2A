@@ -12,7 +12,7 @@ from .contracts import Contracts
 from .mcp_gateway import connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
-from .workflow import solve_case
+from .workflow import make_coordinator, solve_case
 
 
 def _root(value: str) -> Path:
@@ -35,29 +35,85 @@ async def _run(root: Path) -> None:
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
+    # Build coordinator once (loads ScoringPolicy from repo_root).
+    coordinator = make_coordinator(root)
+
+    gateway_cm = None
+    gateway = None
+
+    async def get_gateway():
+        nonlocal gateway, gateway_cm
+        if gateway_cm is not None:
+            try:
+                await gateway_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+        gateway_cm = connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts)
+        gateway = await gateway_cm.__aenter__()
+        return gateway
+
+    try:
+        gw = await get_gateway()
+        discovered_tools = await gw.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+
+        total = len(case_set.case_ids)
+        for idx, case_id in enumerate(case_set.case_ids, 1):
             target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            if target.exists():
+                try:
+                    with open(target, encoding="utf-8") as fp:
+                        existing = json.load(fp)
+                    contracts.validate_output(existing, f"outputs/{case_id}.json")
+                    issue = existing["assessment"]["primary_issue"]
+                    rf = existing["financial_resolution"]["recommended_refund_brl"]
+                    print(f"[{idx:3d}/{total}] {case_id} [CACHED] -> {issue:23s} (refund={rf} BRL)")
+                    continue
+                except Exception:
+                    target.unlink(missing_ok=True)
+
+            case = case_set.cases[case_id]
+            for attempt in range(5):
+                try:
+                    # Lifecycle event 1: case_received (required by scoring-policy-v2)
+                    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                    output = await solve_case(case, gw, trace, coordinator=coordinator)
+                    contracts.validate_output(output, f"outputs/{case_id}.json")
+                    if output.get("case_id") != case_id:
+                        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                    temporary = target.with_suffix(".json.tmp")
+                    temporary.write_text(
+                        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                    )
+                    temporary.replace(target)
+                    # Lifecycle event 7: case_finalized (required by scoring-policy-v2)
+                    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                    
+                    issue = output["assessment"]["primary_issue"]
+                    rf = output["financial_resolution"]["recommended_refund_brl"]
+                    print(f"[{idx:3d}/{total}] {case_id} -> {issue:23s} (refund={rf} BRL)")
+                    break
+                except BaseException as exc:
+                    if attempt < 4:
+                        print(f"[{idx:3d}/{total}] {case_id} retry ({attempt+1}/4) after: {exc} — reconnecting gateway...")
+                        await asyncio.sleep(3.0)
+                        try:
+                            gw = await get_gateway()
+                        except BaseException as conn_err:
+                            print(f"Reconnect failed: {conn_err}, waiting 5s...")
+                            await asyncio.sleep(5.0)
+                            gw = await get_gateway()
+                    else:
+                        raise
+    finally:
+        if gateway_cm is not None:
+            try:
+                await gateway_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
 
 def parser() -> argparse.ArgumentParser:

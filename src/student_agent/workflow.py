@@ -1,18 +1,26 @@
+"""L3A workflow entry-point – delegates to CoordinatorAgent."""
+
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+from .agents.coordinator import CoordinatorAgent
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
 
 
-async def solve_case(
-    case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
-) -> dict[str, Any]:
-    """Implement the L3A coordinator and specialist-agent workflow here.
+def make_coordinator(repo_root: Path) -> CoordinatorAgent:
+    """Factory so CLI can build a coordinator with the correct repo root."""
+    return CoordinatorAgent(repo_root)
 
-    The starter kit intentionally does not generate a fallback answer: submitting an
-    invented answer or evidence reference would violate the competition contract.
-    """
-    del case, gateway, trace
-    raise NotImplementedError("Implement the L3A multi-agent workflow in solve_case()")
+
+async def solve_case(
+    case: dict[str, Any],
+    gateway: EvidenceGateway,
+    trace: TraceWriter,
+    *,
+    coordinator: CoordinatorAgent,
+) -> dict[str, Any]:
+    """Coordinate all specialist agents and return a schema-valid L3A output dict."""
+    return await coordinator.run(case, gateway, trace)
